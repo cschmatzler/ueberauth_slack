@@ -4,7 +4,8 @@ defmodule Ueberauth.Strategy.Slack do
   """
   use Ueberauth.Strategy,
     uid_field: :email,
-    default_scope: "",
+    default_scope: "users:read",
+    default_user_scope: "",
     send_redirect_uri: true,
     oauth2_module: Ueberauth.Strategy.Slack.OAuth
 
@@ -43,17 +44,20 @@ defmodule Ueberauth.Strategy.Slack do
     module = option(conn, :oauth2_module)
     token = apply(module, :get_token!, [[code: code]])
 
-    if token.access_token == nil do
-      set_errors!(conn, [
-        error(token.other_params["error"], token.other_params["error_description"])
-      ])
-    else
-      conn
-      |> store_token(token)
-      |> fetch_auth(token)
-      |> fetch_identity(token)
-      |> fetch_user(token)
-      |> fetch_team(token)
+
+    case token do
+      {%{access_token: nil}, %{access_token: nil} = user_token} ->
+        set_errors!(conn, [
+          error(user_token.other_params["error"], user_token.other_params["error_description"])
+        ])
+
+      {bot_token, %{access_token: nil}} ->
+        handle_token(conn, bot_token)
+        |> store_bot_token(bot_token)
+
+      {bot_token, user_token} ->
+        handle_token(conn, user_token)
+        |> store_bot_token(bot_token)
     end
   end
 
@@ -61,12 +65,25 @@ defmodule Ueberauth.Strategy.Slack do
   def handle_callback!(conn) do
     set_errors!(conn, [error("missing_code", "No code received")])
   end
+  
+  defp handle_token(conn, token) do
+    conn
+    |> store_token(token)
+    |> fetch_auth(token)
+    |> fetch_identity(token)
+    |> fetch_user(token)
+    |> fetch_team(token)
+  end
 
   defp store_token(conn, token) do
     put_private(conn, :slack_token, token)
   end
 
-  defp fetch_auth(conn, token) do
+  defp store_bot_token(conn, token) do
+    put_private(conn, :slack_bot_token, token)
+  end
+
+ defp fetch_auth(conn, token) do
     scope_string = token.other_params["scope"] || ""
     scopes = String.split(scope_string, ",")
 
@@ -74,12 +91,18 @@ defmodule Ueberauth.Strategy.Slack do
       {:ok, %OAuth2.Response{status_code: 401, body: _body}} ->
         set_errors!(conn, [error("token", "unauthorized")])
 
-      {:ok, %OAuth2.Response{status_code: status_code, body: auth}} when status_code in 200..399 ->
+      {:ok, %OAuth2.Response{status_code: status_code, body: auth}}
+      when status_code in 200..399 ->
         cond do
           auth["ok"] ->
             put_private(conn, :slack_auth, auth)
 
           auth["error"] == "invalid_auth" && Enum.member?(scopes, "identity.basic") ->
+            # If the token has only the "identity.basic" scope then it may error
+            # at the "auth.test" endpoint but still succeed at the
+            # "identity.basic" endpoint.
+            # In this case we rely on fetch_identity to set the error if the
+            # token is invalid.
             conn
 
           true ->
@@ -100,29 +123,29 @@ defmodule Ueberauth.Strategy.Slack do
         conn
 
       true ->
-        get_users_identity(conn, token)
-    end
-  end
+        case Ueberauth.Strategy.Slack.OAuth.get(token, "/users.identity") do
+          {:ok, %OAuth2.Response{status_code: 401, body: _body}} ->
+            set_errors!(conn, [error("token", "unauthorized")])
 
-  defp get_users_identity(conn, token) do
-    case Ueberauth.Strategy.Slack.OAuth.get(token, "/users.identity") do
-      {:ok, %OAuth2.Response{status_code: 401, body: _body}} ->
-        set_errors!(conn, [error("token", "unauthorized")])
+          {:ok, %OAuth2.Response{status_code: status_code, body: identity}}
+          when status_code in 200..399 ->
+            if identity["ok"] do
+              put_private(conn, :slack_identity, identity)
+            else
+              set_errors!(conn, [error(identity["error"], identity["error"])])
+            end
 
-      {:ok, %OAuth2.Response{status_code: status_code, body: identity}} when status_code in 200..399 ->
-        if identity["ok"] do
-          put_private(conn, :slack_identity, identity)
-        else
-          set_errors!(conn, [error(identity["error"], identity["error"])])
+          {:error, %OAuth2.Error{reason: reason}} ->
+            set_errors!(conn, [error("OAuth2", reason)])
         end
-
-      {:error, %OAuth2.Error{reason: reason}} ->
-        set_errors!(conn, [error("OAuth2", reason)])
     end
   end
 
+  # If the call to fetch the auth fails, we're going to have failures already in place.
+  # If this happens don't try and fetch the user and just let it fail.
   defp fetch_user(%Plug.Conn{assigns: %{ueberauth_failure: _fails}} = conn, _), do: conn
 
+  # Given the auth and token we can now fetch the user.
   defp fetch_user(conn, token) do
     scope_string = token.other_params["scope"] || ""
     scopes = String.split(scope_string, ",")
@@ -132,27 +155,23 @@ defmodule Ueberauth.Strategy.Slack do
         conn
 
       true ->
-        get_users_info(conn, token)
-    end
-  end
+        auth = conn.private.slack_auth
 
-  defp get_users_info(conn, token) do
-    opts = %{user: conn.private.slack_auth["user_id"]}
+        case Ueberauth.Strategy.Slack.OAuth.get(token, "/users.info", %{user: auth["user_id"]}) do
+          {:ok, %OAuth2.Response{status_code: 401, body: _body}} ->
+            set_errors!(conn, [error("token", "unauthorized")])
 
-    case Ueberauth.Strategy.Slack.OAuth.get(token, "/users.info", opts) do
-      {:ok, %OAuth2.Response{status_code: 401, body: _body}} ->
-        set_errors!(conn, [error("token", "unauthorized")])
+          {:ok, %OAuth2.Response{status_code: status_code, body: user}}
+          when status_code in 200..399 ->
+            if user["ok"] do
+              put_private(conn, :slack_user, user["user"])
+            else
+              set_errors!(conn, [error(user["error"], user["error"])])
+            end
 
-      {:ok, %OAuth2.Response{status_code: status_code, body: user}}
-      when status_code in 200..399 ->
-        if user["ok"] do
-          put_private(conn, :slack_user, user["user"])
-        else
-          set_errors!(conn, [error(user["error"], user["error"])])
+          {:error, %OAuth2.Error{reason: reason}} ->
+            set_errors!(conn, [error("OAuth2", reason)])
         end
-
-      {:error, %OAuth2.Error{reason: reason}} ->
-        set_errors!(conn, [error("OAuth2", reason)])
     end
   end
 
@@ -167,28 +186,26 @@ defmodule Ueberauth.Strategy.Slack do
         conn
 
       true ->
-        get_team_info(conn, token)
-    end
-  end
+        case Ueberauth.Strategy.Slack.OAuth.get(token, "/team.info") do
+          {:ok, %OAuth2.Response{status_code: 401, body: _body}} ->
+            set_errors!(conn, [error("token", "unauthorized")])
 
-  defp get_team_info(conn, token) do
-    case Ueberauth.Strategy.Slack.OAuth.get(token, "/team.info") do
-      {:ok, %OAuth2.Response{status_code: 401, body: _body}} ->
-        set_errors!(conn, [error("token", "unauthorized")])
+          {:ok, %OAuth2.Response{status_code: status_code, body: team}}
+          when status_code in 200..399 ->
+            if team["ok"] do
+              put_private(conn, :slack_team, team["team"])
+            else
+              set_errors!(conn, [error(team["error"], team["error"])])
+            end
 
-      {:ok, %OAuth2.Response{status_code: status_code, body: team}}
-      when status_code in 200..399 ->
-        if team["ok"] do
-          put_private(conn, :slack_team, team["team"])
-        else
-          set_errors!(conn, [error(team["error"], team["error"])])
+          {:error, %OAuth2.Error{reason: reason}} ->
+            set_errors!(conn, [error("OAuth2", reason)])
         end
-
-      {:error, %OAuth2.Error{reason: reason}} ->
-        set_errors!(conn, [error("OAuth2", reason)])
     end
   end
 
+  # Fetch the name to use. We try to start with the most specific name avaialble and
+  # fallback to the least.
   defp name_from_user(nil), do: nil
 
   defp name_from_user(user) do
@@ -205,8 +222,11 @@ defmodule Ueberauth.Strategy.Slack do
   @impl true
   def handle_cleanup!(conn) do
     conn
+    |> put_private(:slack_auth, nil)
+    |> put_private(:slack_identity, nil)
     |> put_private(:slack_user, nil)
     |> put_private(:slack_token, nil)
+    |> put_private(:slack_bot_token, nil)
   end
 
   @impl true

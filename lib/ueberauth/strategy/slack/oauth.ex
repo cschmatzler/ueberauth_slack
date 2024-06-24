@@ -34,11 +34,14 @@ defmodule Ueberauth.Strategy.Slack.OAuth do
     |> OAuth2.Client.authorize_url!(params)
   end
 
-  def get(token, url, headers \\ [], opts \\ []) do
-    [token: token]
-    |> client
-    |> put_param("client_secret", client().client_secret)
-    |> OAuth2.Client.get(url, headers, opts)
+  def get(token, url, params \\ %{},headers \\ [], opts \\ []) do
+    url =
+      [token: token]
+      |> client()
+      |> to_url(url, params)
+
+    headers = [{"authorization", "Bearer #{token.access_token}"}] ++ headers
+    OAuth2.Client.get(client(), url, headers, opts)
   end
 
   def get_token!(params \\ [], options \\ []) do
@@ -46,7 +49,14 @@ defmodule Ueberauth.Strategy.Slack.OAuth do
     options = Keyword.get(options, :options, [])
     client_options = Keyword.get(options, :client_options, [])
     client = OAuth2.Client.get_token!(client(client_options), params, headers, options)
-    client.token
+
+    split_token(client.token)
+  end
+
+  defp split_token(nil), do: {nil, nil}
+
+  defp split_token(token) do
+    {token, OAuth2.AccessToken.new(token.other_params["authed_user"])}
   end
 
   @impl true
@@ -79,6 +89,23 @@ defmodule Ueberauth.Strategy.Slack.OAuth do
         end
     end
   end
+   defp to_url(client, endpoint, params) do
+    client_endpoint =
+      client
+      |> Map.get(endpoint, endpoint)
+      |> endpoint(client)
+
+    final_endpoint =
+      if Enum.empty?(params) do
+        client_endpoint
+      else
+        client_endpoint <> "?" <> URI.encode_query(params)
+      end
+
+    final_endpoint
+  end
+  defp endpoint("/" <> _path = endpoint, client), do: client.site <> endpoint
+  defp endpoint(endpoint, _client), do: endpoint
 
   defp check_config_key_exists(config, key) when is_list(config) do
     unless Keyword.has_key?(config, key) do
