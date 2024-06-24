@@ -1,13 +1,18 @@
 defmodule Ueberauth.Strategy.Slack do
+  @moduledoc """
+  Ueberauth Strategy for Slack.
+  """
   use Ueberauth.Strategy,
     uid_field: :email,
     default_scope: "",
+    send_redirect_uri: true,
     oauth2_module: Ueberauth.Strategy.Slack.OAuth
 
   alias Ueberauth.Auth.Info
   alias Ueberauth.Auth.Credentials
   alias Ueberauth.Auth.Extra
 
+  @impl true
   def handle_request!(conn) do
     opts =
       []
@@ -33,6 +38,7 @@ defmodule Ueberauth.Strategy.Slack do
     end
   end
 
+  @impl true
   def handle_callback!(%Plug.Conn{params: %{"code" => code}} = conn) do
     module = option(conn, :oauth2_module)
     token = apply(module, :get_token!, [[code: code]])
@@ -63,6 +69,7 @@ defmodule Ueberauth.Strategy.Slack do
   defp fetch_auth(conn, token) do
     scope_string = token.other_params["scope"] || ""
     scopes = String.split(scope_string, ",")
+
     case Ueberauth.Strategy.Slack.OAuth.get(token, "/auth.test") do
       {:ok, %OAuth2.Response{status_code: 401, body: _body}} ->
         set_errors!(conn, [error("token", "unauthorized")])
@@ -195,16 +202,19 @@ defmodule Ueberauth.Strategy.Slack do
     |> List.first()
   end
 
+  @impl true
   def handle_cleanup!(conn) do
     conn
     |> put_private(:slack_user, nil)
     |> put_private(:slack_token, nil)
   end
 
+  @impl true
   def uid(conn) do
     Map.get(info(conn), option(conn, :uid_field))
   end
 
+  @impl true
   def credentials(conn) do
     token = conn.private.slack_token
     auth = conn.private[:slack_auth]
@@ -216,9 +226,9 @@ defmodule Ueberauth.Strategy.Slack do
     %Credentials{
       token: token.access_token,
       refresh_token: token.refresh_token,
+      expires: !!token.expires_at,
       expires_at: token.expires_at,
       token_type: token.token_type,
-      expires: !!token.expires_at,
       scopes: scopes,
       other:
         Map.merge(
@@ -235,6 +245,7 @@ defmodule Ueberauth.Strategy.Slack do
     }
   end
 
+  @impl true
   def info(conn) do
     user = conn.private[:slack_user]
     auth = conn.private[:slack_auth]
@@ -268,6 +279,7 @@ defmodule Ueberauth.Strategy.Slack do
     }
   end
 
+  @impl true
   def extra(conn) do
     %Extra{
       raw_info: %{
@@ -293,9 +305,6 @@ defmodule Ueberauth.Strategy.Slack do
     }
   end
 
-  def uid(conn) do
-    conn |> option(:uid_field) |> to_string()
-  end
 
   defp option(conn, key) do
     Keyword.get(options(conn), key, Keyword.get(default_options(), key))

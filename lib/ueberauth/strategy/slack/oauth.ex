@@ -1,4 +1,5 @@
 defmodule Ueberauth.Strategy.Slack.OAuth do
+  @moduledoc "OAuth strategy for Slack"
   use OAuth2.Strategy
 
   @defaults [
@@ -48,10 +49,12 @@ defmodule Ueberauth.Strategy.Slack.OAuth do
     client.token
   end
 
+  @impl true
   def authorize_url(client, params) do
     OAuth2.Strategy.AuthCode.authorize_url(client, params)
   end
 
+  @impl true
   def get_token(client, params, headers) do
     client
     |> put_param("client_secret", client.client_secret)
